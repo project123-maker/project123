@@ -3,49 +3,13 @@
     <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0-windows</TargetFramework>
     <UseWPF>true</UseWPF>
-    <ApplicationManifest>app.manifest</ApplicationManifest>
-    <ApplicationIcon>Assets\logo.ico</ApplicationIcon>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
 
+  <!-- Only force XAML resources; DO NOT list MainWindow.xaml.cs -->
   <ItemGroup>
-    <PackageReference Include="Google.Cloud.Firestore" Version="3.5.0" />
-    <PackageReference Include="Google.Apis.Auth"       Version="1.68.0" />
+    <ApplicationDefinition Include="App.xaml" />
+    <Page Include="Views\MainWindow.xaml" />
   </ItemGroup>
-
-  <ItemGroup>
-    <!-- WPF resources -->
-    <Resource Include="Assets\logo.png" />
-    <Resource Include="Assets\logo.ico" />
-
-    <!-- ship optional service account (either filename) -->
-    <None Update="service-account.json">
-      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-    </None>
-    <None Update="serviceAccount.json">
-      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-    </None>
-
-    <!-- ship sing-box runtime -->
-    <None Update="..\..\bin\sing-box\*">
-      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-      <Link>bin\sing-box\%(Filename)%(Extension)</Link>
-    </None>
-  </ItemGroup>
-  <ItemGroup>
-    <Content Include="..\..\bin\sing-box\**\*">
-      <Link>sing-box\%(RecursiveDir)%(Filename)%(Extension)</Link>
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <CopyToPublishDirectory>Always</CopyToPublishDirectory>
-    </Content>
-  </ItemGroup>
-  
-  <Target Name="CopySingBox" AfterTargets="Publish">
-    <ItemGroup>
-      <SingBoxFiles Include="..\..\bin\sing-box\**\*" />
-    </ItemGroup>
-    <MakeDir Directories="$(PublishDir)sing-box" />
-    <Copy SourceFiles="@(SingBoxFiles)"
-          DestinationFolder="$(PublishDir)sing-box\%(RecursiveDir)"
-          SkipUnchangedFiles="true" />
-  </Target>
 </Project>

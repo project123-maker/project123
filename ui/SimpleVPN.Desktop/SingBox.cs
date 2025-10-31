@@ -1,106 +1,134 @@
-using System.Diagnostics;
-using System.Text.Json;
 using System;
-using System.IO;
 using System.Diagnostics;
+using System.IO;
+using System.Text;
+using System.Text.Json;
+using System.Threading.Tasks;
 
-namespace SimpleVPN.Desktop;
-
-public static class SingBox
+namespace SimpleVPN.Desktop
 {
-    public static string Root => Path.Combine(AppContext.BaseDirectory);
-    public static string BinDir => Path.Combine(Root, "bin", "sing-box");
-    public static string Exe => Path.Combine(BinDir, "sing-box.exe");
-    public static string ConfigPath => Path.Combine(BinDir, "config.json");
-
-    private static Process? _p;
-
-    public static void WriteConfigFromVless(string vless)
+    public static class SingBox
     {
-        // Parse a few bits
-        var uri = new Uri(vless);
-        var uuid = uri.UserInfo;
-        var host = uri.Host;
-        var port = uri.Port;
-        var q = System.Web.HttpUtility.ParseQueryString(uri.Query);
-        var sni = q.Get("sni");
-        var pbk = q.Get("pbk");
-        var sid = q.Get("sid");
-        var fp = q.Get("fp");
-        var flow = q.Get("flow");
+        static Process? _p;
 
-        var cfg = new
+        static string BaseDir => AppContext.BaseDirectory;
+        static string BinDir => Path.Combine(BaseDir, "..", "bin", "sing-box");
+        static string SbExe => Path.Combine(BinDir, "sing-box.exe");
+        static string CfgPath => Path.Combine(BinDir, "config.json");
+
+        public static async Task StartAsync(string vlessUri)
         {
-            log = new { level = "info", timestamp = true },
-            dns = new
+            Directory.CreateDirectory(BinDir);
+            await File.WriteAllTextAsync(CfgPath, BuildConfig(vlessUri), Encoding.UTF8);
+
+            var psi = new ProcessStartInfo
             {
-                servers = new object[] {
-                    new { tag="cf", address="https://1.1.1.1/dns-query", strategy="ipv4_only", detour="proxy" },
-                    new { tag="gg", address="https://dns.google/dns-query", strategy="ipv4_only", detour="proxy" }
-                },
-                strategy = "ipv4_only",
-                disable_cache = true,
-                rules = new object[] { new { outbound = "any", server = "cf" } }
-            },
-            inbounds = new object[] {
-                new {
-                    type="tun", tag="tun-in", interface_name="SimpleVPN",
-                    address = new [] { "172.19.0.1/30" },
-                    mtu=1400, stack="gvisor", auto_route=true, strict_route=true, sniff=true
+                FileName = SbExe,
+                Arguments = $"run -c \"{CfgPath}\"",
+                WorkingDirectory = BinDir,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
+
+            _p = new Process { StartInfo = psi, EnableRaisingEvents = true };
+            _p.Start();
+        }
+
+        public static Task StopAsync()
+        {
+            try
+            {
+                if (_p != null && !_p.HasExited)
+                {
+                    _p.Kill(true);
+                    _p.WaitForExit(2000);
                 }
-            },
-            outbounds = new object[] {
-                new {
-                    type="vless", tag="proxy", server=host, server_port=port, uuid=uuid, flow=flow,
-                    tls = new {
-                        enabled = true, server_name = sni,
-                        reality = new { enabled = true, public_key = pbk, short_id = sid },
-                        utls = fp is null ? null : new { enabled = true, fingerprint = fp }
+            }
+            catch { /* ignore */ }
+            finally { _p = null; }
+            return Task.CompletedTask;
+        }
+
+        // Generates a modern sing-box config using TUN + REALITY vless
+        static string BuildConfig(string vless)
+        {
+            // keep it short; DNS new format (no deprecated)
+            // You can tweak these defaults later
+            var cfg = new
+            {
+                log = new { level = "info" },
+                dns = new
+                {
+                    servers = new object[]
+                    {
+                        new { address = "https://1.1.1.1/dns-query", detour = "proxy" },
+                        new { address = "local" }
                     }
                 },
-                new { type="dns", tag="dns-out" },
-                new { type="direct", tag="direct" },
-                new { type="block", tag="block" }
-            },
-            route = new
-            {
-                auto_detect_interface = true,
-                default_domain_resolver = "cf",
-                final = "proxy",
-                rules = new object[] {
-                    new { protocol = new [] { "dns" }, outbound = "dns-out" },
-                    new { ip_is_private = true, outbound = "direct" }
+                inbounds = new object[]
+                {
+                    new {
+                        type = "tun",
+                        tag = "tun-in",
+                        interface_name = "SimpleVPN",
+                        stack = "gvisor",
+                        mtu = 1400,
+                        inet4_address = new [] { "172.19.0.2/30" },
+                        auto_route = true,
+                        strict_route = true
+                    }
+                },
+                outbounds = new object[]
+                {
+                    new { type = "direct", tag = "direct" },
+                    new { type = "block", tag = "block" },
+                    ParseVlessRealityOutbound(vless)
+                },
+                route = new
+                {
+                    rules = new object[]
+                    {
+                        new { inbound = new []{"tun-in"}, outbound = "proxy" }
+                    }
                 }
-            }
-        };
+            };
 
-        Directory.CreateDirectory(BinDir);
-        File.WriteAllText(ConfigPath, JsonSerializer.Serialize(cfg, new JsonSerializerOptions { WriteIndented = true }));
-    }
-
-    public static void Start()
-    {
-        Stop();
-        _p = new Process
-        {
-            StartInfo = new ProcessStartInfo
-            {
-                FileName = Exe,
-                Arguments = $"run -c \"{ConfigPath}\"",
-                UseShellExecute = false,
-                CreateNoWindow = true
-            }
-        };
-        _p.Start();
-    }
-
-    public static void Stop()
-    {
-        try
-        {
-            if (_p != null && !_p.HasExited) _p.Kill(true);
+            return JsonSerializer.Serialize(cfg, new JsonSerializerOptions { WriteIndented = true });
         }
-        catch { /* ignore */ }
-        _p = null;
+
+        static object ParseVlessRealityOutbound(string vless)
+        {
+            // VERY small parser for vless://…&sni=…&pbk=…
+            // You already supply correct URIs.
+            var uri = new Uri(vless);
+            var host = uri.Host;
+            var port = uri.Port;
+            var id = uri.UserInfo; // uuid
+
+            var qp = System.Web.HttpUtility.ParseQueryString(uri.Query);
+            var sni = qp["sni"] ?? host;
+            var pbk = qp["pbk"] ?? "";
+            var flow = qp["flow"] ?? "";
+
+            return new
+            {
+                type = "vless",
+                tag = "proxy",
+                server = host,
+                server_port = port,
+                uuid = id,
+                flow = string.IsNullOrWhiteSpace(flow) ? null : flow,
+                packet_encoding = "xudp",
+                tls = new
+                {
+                    enabled = true,
+                    server_name = sni,
+                    insecure = false,
+                    reality = new { enabled = true, public_key = pbk, short_id = qp["sid"] ?? "" }
+                }
+            };
+        }
     }
 }
