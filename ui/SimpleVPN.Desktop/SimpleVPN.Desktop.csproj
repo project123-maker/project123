@@ -1,34 +1,37 @@
-<Project Sdk="Microsoft.NET.Sdk.WindowsDesktop">
-
+<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0-windows</TargetFramework>
     <UseWPF>true</UseWPF>
-    <UseWindowsForms>true</UseWindowsForms>
     <Nullable>enable</Nullable>
-    <ImplicitUsings>enable</ImplicitUsings>
-
-    <!-- App entry + icon -->
-    <ApplicationIcon>Assets\logo.ico</ApplicationIcon>
-    <StartupObject>SimpleVPN.Desktop.App</StartupObject>
-
-    <!-- publish config -->
     <PublishSingleFile>true</PublishSingleFile>
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
-    <DebugType>None</DebugType>
-    <DebugSymbols>false</DebugSymbols>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
 
-  <!-- Copy app icon -->
   <ItemGroup>
-    <None Include="..\..\assets\logo.ico" Link="Assets\logo.ico" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\bin\sing-box\**\*">
+      <Link>sing-box\%(RecursiveDir)%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>Always</CopyToPublishDirectory>
+    </Content>
   </ItemGroup>
 
-  <!-- Copy sing-box binaries into publish/bin/sing-box -->
-  <ItemGroup>
-    <None Include="..\..\bin\sing-box\**\*" 
-          Link="bin\sing-box\%(RecursiveDir)%(Filename)%(Extension)" 
-          CopyToOutputDirectory="PreserveNewest" />
-  </ItemGroup>
+  <Target Name="CopySingBoxToPublish" AfterTargets="Publish">
+    <ItemGroup>
+      <_GatewayFiles Include="..\..\bin\sing-box\**\*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_GatewayFiles)"
+          DestinationFolder="$(PublishDir)sing-box\%(RecursiveDir)"
+          SkipUnchangedFiles="true" />
+  </Target>
 
+  <ItemGroup>
+    <Resource Include="assets\logo.ico">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>Always</CopyToPublishDirectory>
+    </Resource>
+  </ItemGroup>
 </Project>
+

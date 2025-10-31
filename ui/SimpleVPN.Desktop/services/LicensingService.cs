@@ -1,109 +1,135 @@
-﻿// ui/SimpleVPN.Desktop/services/LicensingService.cs
 using System;
-using System.Collections.Generic;
+using System.IO;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 
 namespace SimpleVPN.Desktop.Services
 {
-    // Minimal 1-code-1-device flow
     public sealed class LicensingService
     {
-        private readonly Firebase _fb;
+        private readonly Firebase _fb = new Firebase();
+        private readonly string _appDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SimpleVPN");
+        private readonly string _statePath;
         private string? _code;
-        private CancellationTokenSource? _hbCts;
+        private string _deviceId = "";
+        private Timer? _hb;
 
-        public LicensingService(Firebase fb) => _fb = fb;
-
-        public async Task AcquireOrResumeLockAsync(string code, CancellationToken ct = default)
+        public LicensingService()
         {
-            _code = code;
-            await _fb.SignInAnonymouslyAsync(ct);
-
-            var dev = Firebase.DeviceId();
-            var path = $"codes/{code}";
-            var doc = await _fb.GetDocAsync(path, ct);
-            if (doc is null) throw new Exception("Code not found.");
-
-            // check lock
-            var lockedTo = Firebase.GetString(doc.Value, "lock");
-            var owner = Firebase.GetString(doc.Value, "owner");
-
-            if (string.IsNullOrEmpty(lockedTo) || lockedTo == dev)
-            {
-                // lock (or refresh)
-                var fields = new Dictionary<string, object>
-                {
-                    ["lock"] = dev,
-                    ["owner"] = owner ?? _fb.Uid,
-                    ["lastSeen"] = DateTime.UtcNow
-                };
-                await _fb.PatchDocAsync(path, fields, updateMask: new[] { "lock", "owner", "lastSeen" }, ct);
-            }
-            else
-            {
-                throw new Exception("Code is locked on another device.");
-            }
+            Directory.CreateDirectory(_appDir);
+            _statePath = Path.Combine(_appDir, "redeem.json");
+            LoadState();
+            _deviceId = LoadDeviceId();
         }
 
-        public async Task<string> FetchVlessAsync(CancellationToken ct = default)
+        public string? TryGetSavedCode() => _code;
+
+        public async Task RedeemAsync(string code, int staleWindowSeconds)
         {
-            if (string.IsNullOrEmpty(_code)) throw new InvalidOperationException("No code.");
-            var path = $"codes/{_code}";
-            var doc = await _fb.GetDocAsync(path, ct);
-            if (doc is null) throw new Exception("Code not found.");
-            var vless = Firebase.GetString(doc.Value, "vless");
-            if (string.IsNullOrWhiteSpace(vless)) throw new Exception("No VLESS in code document.");
-            return vless!;
+            _code = code; SaveState();
+
+            var doc = await _fb.GetDocAsync($"codes/{code}") ?? throw new Exception("Code not found.");
+            if (Firebase.TryGetBool(doc, "active", out var active) && !active) throw new Exception("Code inactive.");
+
+            string owner = "";
+            Firebase.TryGetString(doc, "lock.ownerDeviceId", out owner);
+            bool lockActive = false;
+            Firebase.TryGetBool(doc, "lock.active", out lockActive);
+            long lastSeen = Firebase.TryGetSeconds(doc, "lock.lastSeen");
+
+            var now = Firebase.NowSeconds();
+            bool canBind = string.IsNullOrEmpty(owner) || owner == _deviceId || !lockActive || (now - lastSeen) > staleWindowSeconds;
+            if (!canBind) throw new Exception("Code in use on another device.");
+
+            await _fb.PatchDocAsync($"codes/{code}", "lock", Firebase.BuildLockFields(_deviceId, true, now));
         }
 
-        public void StartHeartbeat()
+        public async Task<string> GetFreshVlessForCurrentCodeAsync()
         {
-            _hbCts?.Cancel();
-            _hbCts = new CancellationTokenSource();
-            var ct = _hbCts.Token;
+            if (string.IsNullOrWhiteSpace(_code)) throw new Exception("No code saved.");
+            var codeDoc = await _fb.GetDocAsync($"codes/{_code}") ?? throw new Exception("Code missing.");
+            if (!Firebase.TryGetString(codeDoc, "vlessPath", out var path) || string.IsNullOrWhiteSpace(path))
+                throw new Exception("vlessPath not set.");
+            var cfgDoc = await _fb.GetDocAsync(path) ?? throw new Exception("Config missing.");
+            if (!Firebase.TryGetString(cfgDoc, "vless", out var vless) || string.IsNullOrWhiteSpace(vless))
+                throw new Exception("Empty vless.");
 
-            _ = Task.Run(async () =>
+            // Cache silently (never shown to user)
+            File.WriteAllText(Path.Combine(_appDir, "last.vless"), vless);
+            return vless;
+        }
+
+        public async Task StartHeartbeatAsync(int heartbeatIntervalSeconds, int staleWindowSeconds)
+        {
+            if (string.IsNullOrWhiteSpace(_code)) return;
+            _hb?.Dispose();
+            _hb = new Timer(async _ =>
             {
-                if (string.IsNullOrEmpty(_code)) return;
-                var path = $"codes/{_code}";
-                while (!ct.IsCancellationRequested)
+                try
                 {
-                    try
-                    {
-                        await _fb.PatchDocAsync(path, new Dictionary<string, object>
-                        {
-                            ["lastSeen"] = DateTime.UtcNow
-                        }, updateMask: new[] { "lastSeen" }, ct);
-                    }
-                    catch { /* ignore transient */ }
-                    await Task.Delay(7000, ct);
+                    var now = Firebase.NowSeconds();
+                    await _fb.PatchDocAsync($"codes/{_code}", "lock", Firebase.BuildLockFields(_deviceId, true, now));
                 }
-            }, ct);
+                catch { /* ignore */ }
+            }, null, TimeSpan.Zero, TimeSpan.FromSeconds(heartbeatIntervalSeconds));
+            await Task.CompletedTask;
         }
 
-        public async Task SafeReleaseAsync()
+        public async Task StopHeartbeatAsync(bool markInactive)
+        {
+            _hb?.Dispose(); _hb = null;
+            if (string.IsNullOrWhiteSpace(_code)) return;
+            var now = Firebase.NowSeconds();
+            await _fb.PatchDocAsync($"codes/{_code}", "lock", Firebase.BuildLockFields(_deviceId, markInactive, now));
+        }
+
+        // ---------- local state ----------
+        private void LoadState()
         {
             try
             {
-                _hbCts?.Cancel();
-                if (string.IsNullOrEmpty(_code)) return;
-                var path = $"codes/{_code}";
-                var doc = await _fb.GetDocAsync(path);
-                if (doc is null) return;
-
-                var dev = Firebase.DeviceId();
-                var lockedTo = Firebase.GetString(doc.Value, "lock");
-                if (lockedTo == dev)
-                {
-                    await _fb.PatchDocAsync(path, new Dictionary<string, object>
-                    {
-                        ["lock"] = ""
-                    }, updateMask: new[] { "lock" });
-                }
+                if (!File.Exists(_statePath)) return;
+                var s = JsonSerializer.Deserialize<State>(File.ReadAllText(_statePath));
+                _code = s?.Code;
             }
-            catch { /* ignore */ }
+            catch { }
+        }
+        private void SaveState()
+        {
+            try { File.WriteAllText(_statePath, JsonSerializer.Serialize(new State { Code = _code })); } catch { }
+        }
+
+        private static string LoadDeviceId()
+        {
+            try
+            {
+                var val = Microsoft.Win32.Registry.LocalMachine
+                    .OpenSubKey(@"SOFTWARE\Microsoft\Cryptography")?
+                    .GetValue("MachineGuid")?.ToString();
+                if (!string.IsNullOrWhiteSpace(val)) return "win-" + val;
+            }
+            catch { }
+
+            var path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SimpleVPN", "device.json");
+            try
+            {
+                if (File.Exists(path))
+                {
+                    var s = JsonSerializer.Deserialize<State>(File.ReadAllText(path));
+                    if (!string.IsNullOrWhiteSpace(s?.DeviceId)) return s.DeviceId!;
+                }
+            } catch { }
+
+            var id = "win-" + Guid.NewGuid().ToString("N");
+            try { File.WriteAllText(path, JsonSerializer.Serialize(new State { DeviceId = id })); } catch { }
+            return id;
+        }
+
+        private sealed class State
+        {
+            public string? Code { get; set; }
+            public string? DeviceId { get; set; }
         }
     }
 }

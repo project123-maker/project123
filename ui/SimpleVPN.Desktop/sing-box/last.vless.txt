@@ -1,0 +1,5 @@
+﻿vless://00c730d0-e8f4-452a-ad93-37e6a4bcba3e@94.183.233.77:443?encryption=none&security=reality&type=tcp&flow=xtls-rprx-vision&fp=chrome&pbk=YdUWcOAsx1DYAQ45rLny0FMc0FzS9sB2uGKZL_Mu3Cg&sid=7a97d15ac5017905&sni=www.microsoft.com#u09-EU
+
+Set-DnsClientServerAddress                                                               
+-InterfaceAlias "Ethernet"
+-ServerAddresses ("1.1.1.1","8.8.8.8")

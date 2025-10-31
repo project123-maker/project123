@@ -1,131 +1,112 @@
-﻿using System;
-using System.ComponentModel;
+using System;
 using System.IO;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
-using System.Windows.Controls;
-using System.Drawing;              // Icon
-using WF = System.Windows.Forms;
-using SimpleVPN.Desktop.Services;
-// WinForms tray
-
 using SimpleVPN.Desktop.Services;
 
-namespace SimpleVPN.Desktop.Views
+namespace SimpleVPN.Desktop
 {
     public partial class MainWindow : Window
     {
-        private readonly WF.NotifyIcon _tray;
-        private static readonly string AppDataDir =
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SimpleVPN");
+        private readonly LicensingService _lic = new();
+        private readonly SingBox _sb = new();
+        private CancellationTokenSource? _cts;
 
-        // Firebase project creds
-        private readonly Firebase _fb = new Firebase(
-            "simplevpn-3272d",
-            "AIzaSyCV3CSoZ7V8uSGRuFwY82FJ4fnC66Ky5jc"
-        );
+        private readonly string _appDir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SimpleVPN");
+        private readonly string _statePath;
 
-        private LicensingService? _lic;
+        private const int HeartbeatSeconds = 7;
+        private const int StaleSeconds     = 60;
 
         public MainWindow()
         {
             InitializeComponent();
+            Directory.CreateDirectory(_appDir);
+            _statePath = Path.Combine(_appDir, "active.json");
 
-            Directory.CreateDirectory(AppDataDir);
-
-            _tray = new WF.NotifyIcon
-            {
-                Icon = new Icon(Path.Combine(AppContext.BaseDirectory, "assets", "logo.ico")),
-                Visible = false,
-                Text = "SimpleVPN",
-                ContextMenuStrip = new WF.ContextMenuStrip()
-            };
-
-            _tray.ContextMenuStrip.Items.Add("Show", null, (_, __) =>
-            {
-                Show();
-                WindowState = WindowState.Normal;
-                _tray.Visible = false;
-            });
-
-            _tray.ContextMenuStrip.Items.Add("Disconnect", null, async (_, __) =>
-            {
-                await DisconnectAsync();
-            });
-
-            _tray.ContextMenuStrip.Items.Add("Exit (keeps VPN)", null, (_, __) =>
-            {
-                // Do NOT disconnect — keep tunnel alive
-                _tray.Visible = false;
-                System.Windows.Application.Current.Shutdown();
-            });
-
-            Closing += MainWindow_Closing;
+            var state = LoadState();
+            if (!string.IsNullOrWhiteSpace(state.code))
+                RedeemTextBox.Text = state.code;
         }
 
-        private void MainWindow_Closing(object? sender, CancelEventArgs e)
-        {
-            // Hide to tray if VPN is running
-            if (SingBox.IsRunning)
-            {
-                e.Cancel = true;
-                Hide();
-                _tray.Visible = true;
-            }
-        }
-
-        // ----------------- UI Event handlers -----------------
-        private async void ConnectBtn_Click(object sender, RoutedEventArgs e) => await ConnectAsync();
-        private async void DisconnectBtn_Click(object sender, RoutedEventArgs e) => await DisconnectAsync();
-
-        // ----------------- Logic -----------------
-        private async Task ConnectAsync()
+        private async void Connect_Click(object sender, RoutedEventArgs e)
         {
             try
             {
-                StatusText.Text = "Status: redeeming…";
-                var code = RedeemInput.Text?.Trim();
-                if (string.IsNullOrWhiteSpace(code))
-                    throw new Exception("Enter redeem code.");
+                if (_sb.IsRunning) { Logger.Info("Already connected."); return; }
 
-                _lic ??= new LicensingService(_fb);
-                await _lic.AcquireOrResumeLockAsync(code);
+                var code = GetCode();
+                if (string.IsNullOrWhiteSpace(code)) { Logger.Info("Enter redeem code first."); return; }
 
-                StatusText.Text = "Status: fetching VLESS…";
-                var vless = await _lic.FetchVlessAsync();
+                await _lic.RedeemAsync(code, staleWindowSeconds: StaleSeconds);
+                var vless = await _lic.GetFreshVlessForCurrentCodeAsync();
 
-                StatusText.Text = "Status: starting tunnel…";
-                await SingBox.StartAsync(vless);
+                SaveState(new AppState { code = code, lastConnectUtc = DateTime.UtcNow });
 
-                _lic.StartHeartbeat();
+                _cts = new CancellationTokenSource();
+                await _sb.StartAsync(vless, _cts.Token);
 
-                StatusText.Text = "Status: Connected";
+                await _lic.StartHeartbeatAsync(heartbeatIntervalSeconds: HeartbeatSeconds, staleWindowSeconds: StaleSeconds);
+                Logger.Info("Connected.");
             }
             catch (Exception ex)
             {
-                Logger.Log("Connect failed: " + ex);
-                StatusText.Text = "Status: Connect failed";
-                System.Windows.MessageBox.Show(
-                    "Connect failed. See log:\n" + Logger.LogPath,
-                    "SimpleVPN", MessageBoxButton.OK, MessageBoxImage.Error);
+                Logger.Info("Connect failed: " + ex.Message);
+                try { await _lic.StopHeartbeatAsync(markInactive: true); } catch { }
+                _sb.Stop();
             }
         }
 
-        private async Task DisconnectAsync()
+        private async void Disconnect_Click(object sender, RoutedEventArgs e)
         {
             try
             {
-                StatusText.Text = "Status: stopping…";
-                await SingBox.StopAsync();
-                if (_lic != null) await _lic.SafeReleaseAsync();
-                StatusText.Text = "Status: Disconnected";
+                await _lic.StopHeartbeatAsync(markInactive: true);
+                _sb.Stop();
+                Logger.Info("Disconnected.");
             }
-            catch (Exception ex)
+            catch (Exception ex) { Logger.Info("Disconnect error: " + ex.Message); }
+        }
+
+        private string GetCode()
+        {
+            var t = RedeemTextBox.Text?.Trim();
+            if (!string.IsNullOrWhiteSpace(t)) return t;
+            var state = LoadState();
+            return state.code ?? "";
+        }
+
+        protected override async void OnClosed(EventArgs e)
+        {
+            if (_sb.IsRunning)
             {
-                Logger.Log("Disconnect failed: " + ex);
-                StatusText.Text = "Status: Disconnect failed";
+                try { await _lic.StopHeartbeatAsync(markInactive: true); } catch { }
+                _sb.Stop();
             }
+            base.OnClosed(e);
+            Application.Current.Shutdown();
+        }
+
+        private record AppState { public string? code { get; set; } public DateTime? lastConnectUtc { get; set; } }
+
+        private AppState LoadState()
+        {
+            try
+            {
+                if (File.Exists(_statePath))
+                    return JsonSerializer.Deserialize<AppState>(File.ReadAllText(_statePath)) ?? new AppState();
+            } catch { }
+            return new AppState();
+        }
+
+        private void SaveState(AppState s)
+        {
+            try { File.WriteAllText(_statePath, JsonSerializer.Serialize(s)); } catch { }
         }
     }
 }
+
+
