@@ -1,4 +1,4 @@
-﻿// File: services/FirebaseClient.cs
+﻿// ui/SimpleVPN.Desktop/services/Firebase.cs
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -12,7 +12,7 @@ using System.Threading.Tasks;
 
 namespace SimpleVPN.Desktop.Services
 {
-    // NOTE: class name = Firebase (matches what your code is using)
+    // Minimal REST client for Firebase Auth (anonymous) + Firestore
     public sealed class Firebase
     {
         private readonly string _projectId;
@@ -29,37 +29,37 @@ namespace SimpleVPN.Desktop.Services
         }
 
         public string Uid => _uid ?? throw new InvalidOperationException("Not authed");
+        private string FsBase => $"https://firestore.googleapis.com/v1/projects/{_projectId}/databases/(default)/documents";
 
         public async Task SignInAnonymouslyAsync(CancellationToken ct = default)
         {
             var url = $"https://identitytoolkit.googleapis.com/v1/accounts:signUp?key={_apiKey}";
             var body = new { returnSecureToken = true };
-            var res = await PostJsonAsync(url, body, ct);
-            _idToken = res.GetProperty("idToken").GetString();
-            _uid = res.GetProperty("localId").GetString();
+            var rsp = await PostJsonAsync(url, body, ct);
+            _idToken = rsp.GetProperty("idToken").GetString();
+            _uid = rsp.GetProperty("localId").GetString();
         }
 
-        string FsBase => $"https://firestore.googleapis.com/v1/projects/{_projectId}/databases/(default)/documents";
-
+        // ---- Firestore: get/patch/query ----
         public async Task<JsonElement?> GetDocAsync(string path, CancellationToken ct = default)
         {
             var req = new HttpRequestMessage(HttpMethod.Get, $"{FsBase}/{path}");
             AttachAuth(req);
-            var rsp = await Http.SendAsync(req, ct);
-            if (rsp.StatusCode == System.Net.HttpStatusCode.NotFound) return null;
-            rsp.EnsureSuccessStatusCode();
-            using var doc = JsonDocument.Parse(await rsp.Content.ReadAsStringAsync(ct));
+            var res = await Http.SendAsync(req, ct);
+            if (res.StatusCode == System.Net.HttpStatusCode.NotFound) return null;
+            res.EnsureSuccessStatusCode();
+            using var doc = JsonDocument.Parse(await res.Content.ReadAsStringAsync(ct));
             return doc.RootElement.Clone();
         }
 
-        public async Task PatchDocAsync(string path, object payload, IEnumerable<string>? updateMask = null, CancellationToken ct = default)
+        public async Task PatchDocAsync(string path, IDictionary<string, object> fields, IEnumerable<string>? updateMask = null, CancellationToken ct = default)
         {
             var mask = updateMask is null ? "" : $"?updateMask.fieldPaths={string.Join("&updateMask.fieldPaths=", updateMask)}";
             var req = new HttpRequestMessage(HttpMethod.Patch, $"{FsBase}/{path}{mask}");
             AttachAuth(req);
-            req.Content = new StringContent(ToFsDoc(payload), Encoding.UTF8, "application/json");
-            var rsp = await Http.SendAsync(req, ct);
-            rsp.EnsureSuccessStatusCode();
+            req.Content = new StringContent(ToFsDoc(fields), Encoding.UTF8, "application/json");
+            var res = await Http.SendAsync(req, ct);
+            res.EnsureSuccessStatusCode();
         }
 
         public async Task<JsonElement> RunQueryAsync(string collectionPath, string field, string value, CancellationToken ct = default)
@@ -85,9 +85,9 @@ namespace SimpleVPN.Desktop.Services
             var req = new HttpRequestMessage(HttpMethod.Post, url);
             AttachAuth(req);
             req.Content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
-            var rsp = await Http.SendAsync(req, ct);
-            rsp.EnsureSuccessStatusCode();
-            using var doc = JsonDocument.Parse(await rsp.Content.ReadAsStringAsync(ct));
+            var res = await Http.SendAsync(req, ct);
+            res.EnsureSuccessStatusCode();
+            using var doc = JsonDocument.Parse(await res.Content.ReadAsStringAsync(ct));
             return doc.RootElement.Clone();
         }
 
@@ -97,26 +97,38 @@ namespace SimpleVPN.Desktop.Services
                 req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _idToken);
         }
 
-        // -------- Firestore JSON helpers --------
-        private static string ToFsDoc(object o)
+        // ---------- helpers ----------
+        public static string DeviceId()
         {
-            return JsonSerializer.Serialize(new { fields = ToFields(o) });
+            string mg = Microsoft.Win32.Registry.GetValue(
+                @"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Cryptography", "MachineGuid", "")?.ToString() ?? "";
+            string sid = System.Security.Principal.WindowsIdentity.GetCurrent().User?.Value ?? "unknown";
+            using var sha = SHA256.Create();
+            var hash = sha.ComputeHash(Encoding.UTF8.GetBytes(mg + "|" + sid));
+            return Convert.ToHexString(hash).ToLowerInvariant();
+        }
 
-            static Dictionary<string, object> ToFields(object obj)
-            {
-                var dict = new Dictionary<string, object>();
-                foreach (var p in obj.GetType().GetProperties())
-                {
-                    var name = p.Name;
-                    var value = p.GetValue(obj);
-                    dict[name] = ToFsValue(value);
-                }
-                return dict;
-            }
+        private static async Task<JsonElement> PostJsonAsync(string url, object body, CancellationToken ct)
+        {
+            var rsp = await Http.PostAsync(url, new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json"), ct);
+            var txt = await rsp.Content.ReadAsStringAsync(ct);
+            rsp.EnsureSuccessStatusCode();
+            using var doc = JsonDocument.Parse(txt);
+            return doc.RootElement.Clone();
+        }
+
+        // Convert Dictionary<string, object> to Firestore {fields:{...}} JSON
+        private static string ToFsDoc(IDictionary<string, object> src)
+        {
+            var fields = new Dictionary<string, object>();
+            foreach (var (k, v) in src)
+                fields[k] = ToFsValue(v);
+
+            return JsonSerializer.Serialize(new { fields });
 
             static object ToFsValue(object? v)
             {
-                if (v == null) return new { nullValue = (string?)null };
+                if (v is null) return new { nullValue = (string?)null };
                 return v switch
                 {
                     string s => new { stringValue = s },
@@ -131,45 +143,11 @@ namespace SimpleVPN.Desktop.Services
             }
         }
 
-        // -------- Field readers --------
-        public static string? GetString(JsonElement document, string fieldPath)
+        // Readers
+        public static string? GetString(JsonElement doc, string field)
         {
-            if (!document.TryGetProperty("fields", out var fields)) return null;
-            if (!fields.TryGetProperty(fieldPath, out var f)) return null;
-            return f.TryGetProperty("stringValue", out var s) ? s.GetString() : null;
-        }
-
-        public static bool? GetBool(JsonElement document, string fieldPath)
-        {
-            if (!document.TryGetProperty("fields", out var fields)) return null;
-            if (!fields.TryGetProperty(fieldPath, out var f)) return null;
-            return f.TryGetProperty("booleanValue", out var b) ? b.GetBoolean() : (bool?)null;
-        }
-
-        public static JsonElement? GetMap(JsonElement document, string fieldPath)
-        {
-            if (!document.TryGetProperty("fields", out var fields)) return null;
-            if (!fields.TryGetProperty(fieldPath, out var f)) return null;
-            return f.TryGetProperty("mapValue", out var m) ? m.GetProperty("fields") : (JsonElement?)null;
-        }
-
-        // Stable device id
-        public static string DeviceId()
-        {
-            string mg = Microsoft.Win32.Registry.GetValue(@"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Cryptography", "MachineGuid", "")?.ToString() ?? "";
-            string sid = System.Security.Principal.WindowsIdentity.GetCurrent().User?.Value ?? "unknown";
-            using var sha = SHA256.Create();
-            var hash = sha.ComputeHash(Encoding.UTF8.GetBytes(mg + "|" + sid));
-            return Convert.ToHexString(hash).ToLowerInvariant();
-        }
-
-        private static async Task<JsonElement> PostJsonAsync(string url, object body, CancellationToken ct)
-        {
-            var rsp = await Http.PostAsync(url, new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json"), ct);
-            var txt = await rsp.Content.ReadAsStringAsync(ct);
-            rsp.EnsureSuccessStatusCode();
-            using var doc = JsonDocument.Parse(txt);
-            return doc.RootElement.Clone();
+            if (!doc.TryGetProperty("fields", out var f)) return null;
+            return f.TryGetProperty(field, out var v) && v.TryGetProperty("stringValue", out var s) ? s.GetString() : null;
         }
     }
 }

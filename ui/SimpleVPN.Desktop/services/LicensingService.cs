@@ -1,4 +1,4 @@
-﻿// File: services/LicensingService.cs
+﻿// ui/SimpleVPN.Desktop/services/LicensingService.cs
 using System;
 using System.Collections.Generic;
 using System.Text.Json;
@@ -7,156 +7,103 @@ using System.Threading.Tasks;
 
 namespace SimpleVPN.Desktop.Services
 {
-    public sealed class LicensingService : IDisposable
+    // Minimal 1-code-1-device flow
+    public sealed class LicensingService
     {
         private readonly Firebase _fb;
-        private readonly string _deviceId;
-        private string? _activeCode;
+        private string? _code;
         private CancellationTokenSource? _hbCts;
 
-        public LicensingService(Firebase fb)
-        {
-            _fb = fb;
-            _deviceId = Firebase.DeviceId();
-        }
+        public LicensingService(Firebase fb) => _fb = fb;
 
         public async Task AcquireOrResumeLockAsync(string code, CancellationToken ct = default)
         {
-            // 1) ensure auth
+            _code = code;
             await _fb.SignInAnonymouslyAsync(ct);
-            var uid = _fb.Uid;
 
-            // 2) read code doc
+            var dev = Firebase.DeviceId();
             var path = $"codes/{code}";
             var doc = await _fb.GetDocAsync(path, ct);
-            if (doc is null)
-                throw new InvalidOperationException("Invalid code.");
+            if (doc is null) throw new Exception("Code not found.");
 
-            // read current lock (if any)
-            var fields = doc.Value.GetProperty("fields");
-            string? owner = Firebase.GetString(doc.Value, "owner");
-            var lockMap = Firebase.GetMap(doc.Value, "lock");
+            // check lock
+            var lockedTo = Firebase.GetString(doc.Value, "lock");
+            var owner = Firebase.GetString(doc.Value, "owner");
 
-            string? lockedDevice = null;
-            bool? lockActive = null;
-
-            if (lockMap is JsonElement m)
+            if (string.IsNullOrEmpty(lockedTo) || lockedTo == dev)
             {
-                lockedDevice = Firebase.GetString(new JsonElement { }, ""); // placeholder not used
-                // manual pull:
-                try
+                // lock (or refresh)
+                var fields = new Dictionary<string, object>
                 {
-                    var mv = m; // fields of map lock
-                    if (mv.TryGetProperty("deviceId", out var did) && did.TryGetProperty("stringValue", out var s1))
-                        lockedDevice = s1.GetString();
-                    if (mv.TryGetProperty("active", out var act) && act.TryGetProperty("booleanValue", out var b1))
-                        lockActive = b1.GetBoolean();
-                }
-                catch { /* ignore */ }
-            }
-
-            // 3) decide: take or reuse
-            var take = false;
-            if (owner is null || owner == uid)
-            {
-                // same owner or unowned ⇒ ok to take
-                if (lockedDevice is null || lockedDevice == _deviceId || lockActive == false)
-                    take = true;
-            }
-
-            if (!take)
-                throw new InvalidOperationException("Code is locked by another device.");
-
-            // 4) write/merge lock
-            var payload = new Dictionary<string, object>
-            {
-                ["owner"] = uid,
-                ["lock"] = new Dictionary<string, object>
-                {
-                    ["deviceId"] = _deviceId,
-                    ["platform"] = "windows",
-                    ["active"] = true,
+                    ["lock"] = dev,
+                    ["owner"] = owner ?? _fb.Uid,
                     ["lastSeen"] = DateTime.UtcNow
-                }
-            };
-
-            await _fb.PatchDocAsync(path, payload, ct: ct);
-            _activeCode = code;
+                };
+                await _fb.PatchDocAsync(path, fields, updateMask: new[] { "lock", "owner", "lastSeen" }, ct);
+            }
+            else
+            {
+                throw new Exception("Code is locked on another device.");
+            }
         }
 
         public async Task<string> FetchVlessAsync(CancellationToken ct = default)
         {
-            if (_activeCode is null) throw new InvalidOperationException("No active code.");
-
-            var doc = await _fb.GetDocAsync($"codes/{_activeCode}", ct);
-            if (doc is null) throw new InvalidOperationException("Code vanished.");
-
-            // Prefer fields.vless.stringValue
+            if (string.IsNullOrEmpty(_code)) throw new InvalidOperationException("No code.");
+            var path = $"codes/{_code}";
+            var doc = await _fb.GetDocAsync(path, ct);
+            if (doc is null) throw new Exception("Code not found.");
             var vless = Firebase.GetString(doc.Value, "vless");
-            if (string.IsNullOrWhiteSpace(vless))
-                throw new InvalidOperationException("No VLESS config on this code.");
+            if (string.IsNullOrWhiteSpace(vless)) throw new Exception("No VLESS in code document.");
             return vless!;
         }
 
-        public void StartHeartbeat(TimeSpan? interval = null)
+        public void StartHeartbeat()
         {
-            if (_activeCode is null) return;
             _hbCts?.Cancel();
             _hbCts = new CancellationTokenSource();
+            var ct = _hbCts.Token;
 
-            var iv = interval ?? TimeSpan.FromSeconds(7);
             _ = Task.Run(async () =>
             {
-                var ct = _hbCts!.Token;
+                if (string.IsNullOrEmpty(_code)) return;
+                var path = $"codes/{_code}";
                 while (!ct.IsCancellationRequested)
                 {
                     try
                     {
-                        await _fb.PatchDocAsync($"codes/{_activeCode}", new Dictionary<string, object>
+                        await _fb.PatchDocAsync(path, new Dictionary<string, object>
                         {
-                            ["lock"] = new Dictionary<string, object>
-                            {
-                                ["deviceId"] = _deviceId,
-                                ["platform"] = "windows",
-                                ["active"] = true,
-                                ["lastSeen"] = DateTime.UtcNow
-                            }
-                        }, ct: ct);
+                            ["lastSeen"] = DateTime.UtcNow
+                        }, updateMask: new[] { "lastSeen" }, ct);
                     }
-                    catch { /* swallow; next tick */ }
-                    try { await Task.Delay(iv, ct); } catch { break; }
+                    catch { /* ignore transient */ }
+                    await Task.Delay(7000, ct);
                 }
-            }, _hbCts.Token);
+            }, ct);
         }
 
-        public async Task SafeReleaseAsync(CancellationToken ct = default)
+        public async Task SafeReleaseAsync()
         {
             try
             {
                 _hbCts?.Cancel();
-                if (_activeCode is null) return;
+                if (string.IsNullOrEmpty(_code)) return;
+                var path = $"codes/{_code}";
+                var doc = await _fb.GetDocAsync(path);
+                if (doc is null) return;
 
-                await _fb.PatchDocAsync($"codes/{_activeCode}", new Dictionary<string, object>
+                var dev = Firebase.DeviceId();
+                var lockedTo = Firebase.GetString(doc.Value, "lock");
+                if (lockedTo == dev)
                 {
-                    ["lock"] = new Dictionary<string, object>
+                    await _fb.PatchDocAsync(path, new Dictionary<string, object>
                     {
-                        ["deviceId"] = _deviceId,
-                        ["platform"] = "windows",
-                        ["active"] = false,
-                        ["lastSeen"] = DateTime.UtcNow
-                    }
-                }, ct: ct);
+                        ["lock"] = ""
+                    }, updateMask: new[] { "lock" });
+                }
             }
-            finally
-            {
-                _activeCode = null;
-            }
-        }
-
-        public void Dispose()
-        {
-            _hbCts?.Cancel();
-            _hbCts?.Dispose();
+            catch { /* ignore */ }
         }
     }
 }
