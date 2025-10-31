@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Security.Principal;
 using System.Windows;
 
+
 namespace SimpleVPN.Desktop
 {
     public partial class App : Application
