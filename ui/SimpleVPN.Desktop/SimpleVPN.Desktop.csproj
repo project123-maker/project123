@@ -1,15 +1,17 @@
-<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk.WindowsDesktop">
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0-windows</TargetFramework>
     <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <ApplicationIcon>Assets\logo.ico</ApplicationIcon>
+    <StartupObject>SimpleVPN.Desktop.App</StartupObject>
   </PropertyGroup>
 
-  <!-- Only force XAML resources; DO NOT list MainWindow.xaml.cs -->
   <ItemGroup>
-    <ApplicationDefinition Include="App.xaml" />
-    <Page Include="Views\MainWindow.xaml" />
+    <None Include="assets\logo.ico" CopyToOutputDirectory="Always" />
+    <None Include="sing-box\**\*" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>
