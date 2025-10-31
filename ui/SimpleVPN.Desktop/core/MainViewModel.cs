@@ -4,6 +4,9 @@ using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Input;
+using SimpleVPN.Desktop.Core;      // for SingBoxService, LicensingService
+using SimpleVPN.Desktop;  // if you reference services/Firebase.cs
+
 
 namespace SimpleVPN.Desktop
 {

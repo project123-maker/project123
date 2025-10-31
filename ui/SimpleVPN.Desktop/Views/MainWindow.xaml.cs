@@ -1,5 +1,8 @@
 using System.Timers;
 using System.Windows;
+using System.Threading;
+using System.Threading.Tasks;
+
 
 namespace SimpleVPN.Desktop;
 
@@ -24,52 +27,25 @@ public partial class MainWindow : Window
     {
         try
         {
-            ConnectBtn.IsEnabled = false;
-            DisconnectBtn.IsEnabled = false;
+            StatusText.Text = "Status: Redeeming…";
+            var code = RedeemInput.Text?.Trim();
 
-            await _fb.EnsureAnonAsync();
+            // 1) Redeem (or no-op if already locked for this device)
+            await Services.License.RedeemOrResumeAsync(code);     // <-- uses your Firestore logic
 
-            var code = RedeemBox.Text.Trim();
-            if (string.IsNullOrEmpty(code) && string.IsNullOrEmpty(_activeCode))
-            {
-                Log("Enter redeem code first.");
-                return;
-            }
-            if (!string.IsNullOrEmpty(code))
-            {
-                // redeem/refresh grant & lock
-                await RedeemAndLockAsync(code);
-                _activeCode = code;
-            }
-            else
-            {
-                // no new code typed — verify still locked to me
-                if (string.IsNullOrEmpty(_activeCode))
-                {
-                    Log("No redeem code set.");
-                    return;
-                }
-                await EnsureStillLockedAsync(_activeCode);
-            }
+            StatusText.Text = "Status: Fetching config…";
+            var vless = await Services.Configs.GetCurrentVlessAsync(); // reads configs/current.vless (or by path on code)
 
-            // Always fetch latest vless (rotates when blocked)
-            var vless = await FetchLatestVlessAsync();
-            _currentVless = vless;
-            SingBox.WriteConfigFromVless(vless);
-            SingBox.Start();
+            StatusText.Text = "Status: Starting tunnel…";
+            await Services.Tunnel.StartAsync(vless);               // your sing-box start
 
-            _hb.Start();
-            Log($"Connected as {_fb.Uid?.Substring(0, 6)}…");
+            StatusText.Text = "Status: Connected";
         }
         catch (Exception ex)
         {
-            Log("Connect failed: " + ex.Message);
-            SingBox.Stop();
-        }
-        finally
-        {
-            ConnectBtn.IsEnabled = true;
-            DisconnectBtn.IsEnabled = true;
+            StatusText.Text = "Status: Failed";
+            Services.Log.Error(ex);
+            MessageBox.Show(ex.Message, "Connect failed", MessageBoxButton.OK, MessageBoxImage.Error);
         }
     }
 
@@ -77,22 +53,19 @@ public partial class MainWindow : Window
     {
         try
         {
-            DisconnectBtn.IsEnabled = false;
-            _hb.Stop();
-            SingBox.Stop();
-            if (!string.IsNullOrEmpty(_activeCode))
-                await ReleaseLockAsync(_activeCode);
-            Log("Disconnected.");
+            StatusText.Text = "Status: Stopping…";
+            await Services.Tunnel.StopAsync();                     // your sing-box stop
+            await Services.License.ReleaseIfSafeAsync();           // optional: your heartbeat/unlock logic
+            StatusText.Text = "Status: Disconnected";
         }
         catch (Exception ex)
         {
-            Log("Disconnect err: " + ex.Message);
-        }
-        finally
-        {
-            DisconnectBtn.IsEnabled = true;
+            StatusText.Text = "Status: Failed to stop";
+            Services.Log.Error(ex);
+            MessageBox.Show(ex.Message, "Disconnect failed", MessageBoxButton.OK, MessageBoxImage.Error);
         }
     }
+
 
     // —— Firestore flows ——
 

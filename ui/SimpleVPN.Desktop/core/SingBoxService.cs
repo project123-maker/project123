@@ -2,132 +2,171 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Text.Json;
-using System.Text.Json.Nodes;
+using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
 
-namespace SimpleVPN.Desktop
+namespace SimpleVPN.Desktop.Core
 {
     public sealed class SingBoxService
     {
-        private readonly AppSettings _settings;
-        private Process? _proc;
+        private readonly string _root;
+        private readonly string _sbExe;
+        private Process _proc;
 
-        public SingBoxService(AppSettings settings) => _settings = settings;
-
-        public async Task StartAsync(string vless, CancellationToken ct)
+        public SingBoxService()
         {
-            Directory.CreateDirectory(_settings.SingBoxDir);
-            var cfgJson = BuildConfigFromVless(vless);
-            await File.WriteAllTextAsync(_settings.ConfigPath, cfgJson, ct);
+            _root = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "bin", "sing-box"));
+            _sbExe = Path.Combine(_root, "sing-box.exe");
+        }
 
-            // Kill leftovers
-            await StopAsync();
+        public bool IsRunning => _proc != null && !_proc.HasExited;
 
-            var exe = Path.Combine(_settings.SingBoxDir, "sing-box.exe");
-            if (!File.Exists(exe)) throw new FileNotFoundException("sing-box.exe not found", exe);
+        public async Task StartAsync(string vless, CancellationToken ct = default)
+        {
+            if (string.IsNullOrWhiteSpace(vless)) throw new ArgumentException("vless is empty");
+            WriteConfig(vless);
+
+            if (!File.Exists(_sbExe))
+                throw new FileNotFoundException("sing-box.exe not found", _sbExe);
+
+            if (IsRunning) await StopAsync();
 
             var psi = new ProcessStartInfo
             {
-                FileName = exe,
-                Arguments = $"run -c \"{_settings.ConfigPath}\"",
-                WorkingDirectory = _settings.SingBoxDir,
+                FileName = _sbExe,
+                Arguments = "run -c .\\config.json",
+                WorkingDirectory = _root,
                 UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
                 CreateNoWindow = true
             };
-            _proc = Process.Start(psi) ?? throw new InvalidOperationException("Failed to start sing-box.");
+
+            _proc = new Process { StartInfo = psi, EnableRaisingEvents = true };
+            _proc.OutputDataReceived += (_, e) => { if (!string.IsNullOrEmpty(e.Data)) Debug.WriteLine(e.Data); };
+            _proc.ErrorDataReceived += (_, e) => { if (!string.IsNullOrEmpty(e.Data)) Debug.WriteLine(e.Data); };
+
+            _proc.Start();
+            _proc.BeginOutputReadLine();
+            _proc.BeginErrorReadLine();
+
+            // tiny grace wait so the TUN comes up
             await Task.Delay(300, ct);
         }
 
-        public async Task StopAsync()
+        public Task StopAsync()
         {
             try
             {
-                if (_proc is { HasExited: false })
+                if (IsRunning)
                 {
-                    _proc.Kill(true);
-                    _proc.Dispose();
+                    _proc.Kill(entireProcessTree: true);
+                    _proc.WaitForExit(2000);
                 }
             }
             catch { /* ignore */ }
-            finally { _proc = null; }
-            await Task.CompletedTask;
+            finally
+            {
+                _proc?.Dispose();
+                _proc = null;
+            }
+            return Task.CompletedTask;
         }
 
-        private static string BuildConfigFromVless(string vless)
+        /// <summary>Writes config.json next to sing-box.exe (safe JSON builder, no new syntax).</summary>
+        public void WriteConfig(string vless)
         {
-            // Parse VLESS URI like: vless://UUID@host:port?...&sni=...&pbk=...&sid=...&flow=...&fp=chrome
+            Directory.CreateDirectory(_root);
+            File.WriteAllText(Path.Combine(_root, "last.vless.txt"), vless ?? "");
+
+            // parse vless
             var u = new Uri(vless);
             var uuid = u.UserInfo;
             var host = u.Host;
-            var port = u.Port;
-            var qp = System.Web.HttpUtility.ParseQueryString(u.Query);
+            var port = u.Port == -1 ? 443 : u.Port;
 
-            // DNS goes through the proxy so it still works under blocks
-            var dns = new JsonObject
-            {
-                ["servers"] = new JsonArray
-                {
-                    new JsonObject { ["tag"]="cf", ["address"]="https://1.1.1.1/dns-query", ["strategy"]="ipv4_only", ["detour"]="proxy" },
-                    new JsonObject { ["tag"]="gg", ["address"]="https://dns.google/dns-query", ["strategy"]="ipv4_only", ["detour"]="proxy" }
-                },
-                ["strategy"] = "ipv4_only",
-                ["disable_cache"] = true
-            };
+            // parse query
+            var q = System.Web.HttpUtility.ParseQueryString(u.Query);
+            string sni = q["sni"] ?? host;
+            string pbk = q["pbk"] ?? "";
+            string sid = q["sid"] ?? "";
+            string flow = q["flow"] ?? "";
+            string fp = q["fp"] ?? "chrome";
 
-            var tls = new JsonObject
+            // build config (old, stable fields to avoid breaking)
+            var cfg = new
             {
-                ["enabled"] = true,
-                ["server_name"] = qp["sni"] ?? "",
-                ["reality"] = new JsonObject
+                log = new { level = "info", timestamp = true },
+                dns = new
                 {
-                    ["enabled"] = true,
-                    ["public_key"] = qp["pbk"] ?? "",
-                    ["short_id"] = qp["sid"] ?? ""
-                }
-            };
-            var fp = qp["fp"]; if (!string.IsNullOrWhiteSpace(fp))
-                tls["utls"] = new JsonObject { ["enabled"] = true, ["fingerprint"] = fp };
-
-            var cfg = new JsonObject
-            {
-                ["log"] = new JsonObject { ["level"] = "info", ["timestamp"] = true },
-                ["dns"] = dns,
-                ["inbounds"] = new JsonArray
-                {
-                    new JsonObject
+                    strategy = "ipv4_only",
+                    disable_cache = true,
+                    servers = new object[]
                     {
-                        ["type"]="tun","tag"]="tun-in","interface_name"]="SimpleVPN",
-                        ["address"]= new JsonArray { "172.19.0.1/30" },
-                        ["mtu"]=1400, ["stack"]="gvisor", ["auto_route"]=true, ["strict_route"]=true, ["sniff"]=true
-                    }
-                },
-                ["outbounds"] = new JsonArray
-                {
-                    new JsonObject
-                    {
-                        ["type"]="vless","tag"]="proxy",
-                        ["server"]=host, ["server_port"]=port, ["uuid"]=uuid,
-                        ["flow"]= qp["flow"] ?? "",
-                        ["tls"]= tls
+                        new { tag = "cf", address = "https://1.1.1.1/dns-query", strategy = "ipv4_only", detour = "proxy" },
+                        new { tag = "gg", address = "https://dns.google/dns-query", strategy = "ipv4_only", detour = "proxy" }
                     },
-                    new JsonObject { ["type"]="direct","tag"]="direct" },
-                    new JsonObject { ["type"]="block","tag"]="block" }
-                },
-                ["route"] = new JsonObject
-                {
-                    ["auto_detect_interface"] = true,
-                    ["default_domain_resolver"] = "cf",
-                    ["final"] = "proxy",
-                    ["rules"] = new JsonArray
+                    rules = new object[]
                     {
-                        new JsonObject { ["protocol"]= new JsonArray { "dns" }, ["outbound"]="proxy" }, // send DoH via proxy
-                        new JsonObject { ["ip_is_private"]=true, ["outbound"]="direct" }               // keep LAN direct
+                        new { outbound = "any", server = "cf" }
+                    }
+                },
+                inbounds = new object[]
+                {
+                    new {
+                        type = "tun",
+                        tag = "tun-in",
+                        interface_name = "SimpleVPN",
+                        address = new [] { "172.19.0.1/30" },
+                        mtu = 1400,
+                        stack = "gvisor",
+                        auto_route = true,
+                        strict_route = true,
+                        sniff = true
+                    }
+                },
+                outbounds = new object[]
+                {
+                    new {
+                        type = "vless",
+                        tag = "proxy",
+                        server = host,
+                        server_port = port,
+                        uuid = uuid,
+                        flow = flow,
+                        tls = new {
+                            enabled = true,
+                            server_name = sni,
+                            reality = new { enabled = true, public_key = pbk, short_id = sid },
+                            utls = new { enabled = true, fingerprint = fp }
+                        }
+                    },
+                    new { type = "dns", tag = "dns-out" },
+                    new { type = "direct", tag = "direct" },
+                    new { type = "block", tag = "block" }
+                },
+                route = new
+                {
+                    auto_detect_interface = true,
+                    default_domain_resolver = "cf",
+                    final = "proxy",
+                    rules = new object[]
+                    {
+                        new { protocol = new [] { "dns" }, outbound = "dns-out" },
+                        new { ip_is_private = true, outbound = "direct" }
                     }
                 }
             };
 
-            return cfg.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
+            var opts = new JsonSerializerOptions
+            {
+                DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+                WriteIndented = true
+            };
+
+            var json = JsonSerializer.Serialize(cfg, opts);
+            File.WriteAllText(Path.Combine(_root, "config.json"), json);
         }
     }
 }

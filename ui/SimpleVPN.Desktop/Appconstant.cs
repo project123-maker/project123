@@ -1,4 +1,6 @@
 ﻿namespace SimpleVPN.Desktop;
+using System;
+
 
 public static class AppSecrets
 {
@@ -13,6 +15,7 @@ public static class AppSecrets
     public const string ConnsCol = "connections";
     public const string ConfigsCol = "configs";   // contains docs like "current", "u08", ...
     public const string DefaultConfigDoc = "current"; // fallback when code has no vlessPath
+
 
     // heartbeat (matches your Android habit)
     public static readonly TimeSpan HeartbeatPeriod = TimeSpan.FromSeconds(7);
