@@ -1,0 +1,16 @@
+bin/
+obj/
+node_modules/
+publish/
+*.exe
+*.apk
+*.log
+*.sqlite
+*.db
+*.tmp
+*.bak
+.vscode/
+.idea/
+.env
+config.json
+firebaseConfig.json
