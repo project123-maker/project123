@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Text;
@@ -11,93 +10,65 @@ namespace SimpleVPN.Desktop
     public static class SingBox
     {
         private static Process? _p;
-        public static bool IsRunning => _p is { HasExited: false };
 
-        // In publish, sing-box folder sits next to the exe
-        private static string BaseDir => AppContext.BaseDirectory;
-        private static string SbDir => Path.Combine(BaseDir, "sing-box");
-        private static string SbExe => Path.Combine(SbDir, "sing-box.exe");
-        private static string CfgPath => Path.Combine(SbDir, "config.json");
+        // publish\  ->  ..\bin\sing-box\ (exe + wintun.dll + config.json)
+        static string BaseDir => AppContext.BaseDirectory;
+        static string BinDir => Path.GetFullPath(Path.Combine(BaseDir, "..", "bin", "sing-box"));
+        static string SbExe => Path.Combine(BinDir, "sing-box.exe");
+        static string CfgPath => Path.Combine(BinDir, "config.json");
+
+        public static bool IsRunning => _p is { HasExited: false } && !_p.HasExited;
 
         public static async Task StartAsync(string vlessUri)
         {
-            try
+            Directory.CreateDirectory(BinDir);
+
+            // sanity: sing-box + wintun must exist
+            if (!File.Exists(SbExe)) throw new FileNotFoundException("sing-box.exe missing", SbExe);
+            if (!File.Exists(Path.Combine(BinDir, "wintun.dll"))) throw new FileNotFoundException("wintun.dll missing");
+
+            await File.WriteAllTextAsync(CfgPath, BuildConfig(vlessUri), Encoding.UTF8).ConfigureAwait(false);
+
+            var psi = new ProcessStartInfo
             {
-                Directory.CreateDirectory(SbDir);
-                EnsureBinaries();
+                FileName = SbExe,
+                Arguments = $"run -c \"{CfgPath}\"",
+                WorkingDirectory = BinDir,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
 
-                var cfg = BuildConfig(vlessUri);
-                await File.WriteAllTextAsync(CfgPath, cfg, Encoding.UTF8);
+            _p = new Process { StartInfo = psi, EnableRaisingEvents = true };
+            _p.OutputDataReceived += (_, e) => { if (!string.IsNullOrEmpty(e.Data)) Logger.Log("[sb] " + e.Data); };
+            _p.ErrorDataReceived += (_, e) => { if (!string.IsNullOrEmpty(e.Data)) Logger.Log("[sb!] " + e.Data); };
 
-                var psi = new ProcessStartInfo
-                {
-                    FileName = SbExe,
-                    Arguments = $"run -c \"{CfgPath}\"",
-                    WorkingDirectory = SbDir,
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true
-                };
-
-                // kill previous if any
-                await StopAsync();
-
-                _p = new Process { StartInfo = psi, EnableRaisingEvents = true };
-                _p.OutputDataReceived += (_, e) => { if (!string.IsNullOrEmpty(e.Data)) Logger.Log("[SB] " + e.Data); };
-                _p.ErrorDataReceived += (_, e) => { if (!string.IsNullOrEmpty(e.Data)) Logger.Log("[SB] " + e.Data); };
-                _p.Exited += (_, __) => Logger.Log("[SB] exited");
-
-                Logger.Log("Starting sing-box…");
-                _p.Start();
-                _p.BeginOutputReadLine();
-                _p.BeginErrorReadLine();
-            }
-            catch (Exception ex)
-            {
-                Logger.Log("StartAsync error: " + ex);
-                throw;
-            }
+            _p.Start();
+            _p.BeginOutputReadLine();
+            _p.BeginErrorReadLine();
         }
 
         public static Task StopAsync()
         {
             try
             {
-                if (_p is { HasExited: false })
+                if (_p != null && !_p.HasExited)
                 {
-                    Logger.Log("Stopping sing-box…");
                     _p.Kill(entireProcessTree: true);
-                    if (!_p.WaitForExit(2000))
-                        Logger.Log("sing-box did not exit in 2s (killed).");
+                    _p.WaitForExit(2000);
                 }
             }
-            catch (Exception ex)
-            {
-                Logger.Log("StopAsync error: " + ex);
-            }
-            finally
-            {
-                _p = null;
-            }
+            catch { /* ignore */ }
+            finally { _p = null; }
             return Task.CompletedTask;
         }
 
-        private static void EnsureBinaries()
+        // ---- config ----
+        static string BuildConfig(string vless)
         {
-            if (!File.Exists(SbExe))
-                throw new FileNotFoundException("sing-box.exe missing at " + SbExe);
-            var wintun = Path.Combine(SbDir, "wintun.dll");
-            if (!File.Exists(wintun))
-                Logger.Log("WARNING: wintun.dll not found next to sing-box.exe (TUN will fail).");
-        }
+            var (host, port, uuid, sni, pbk, sid, flow, fp) = ParseVless(vless);
 
-        // ----- Config -----
-        private static string BuildConfig(string vless)
-        {
-            var ob = ParseVless(vless);
-
-            // Stable, leak-free defaults
             var cfg = new
             {
                 log = new { level = "info" },
@@ -106,61 +77,63 @@ namespace SimpleVPN.Desktop
                 {
                     servers = new object[]
                     {
-                        new { tag = "cf", address = "https://cloudflare-dns.com/dns-query", detour = "proxy" },
-                        new { tag = "gg", address = "https://dns.google/dns-query",          detour = "proxy" },
-                        new { tag = "local", address = "local" }
+                        // Bootstrap first: system/local resolver (never through proxy)
+                        new { address = "local" },
+                        // DoH directly (not through proxy) so the first handshake can succeed
+                        new { address = "https://1.1.1.1/dns-query", detour = "direct" }
                     },
-                    strategy = "prefer_ipv4"
+                    strategy = "ipv4_only" // avoid v6 pitfalls on some ISPs
                 },
 
                 inbounds = new object[]
                 {
-                    new
-                    {
+                    new {
                         type = "tun",
-                        tag  = "tun-in",
+                        tag = "tun-in",
                         interface_name = "SimpleVPN",
                         stack = "gvisor",
                         mtu = 1400,
+                        inet4_address = new []{ "172.19.0.2/30" },
                         auto_route = true,
-                        strict_route = false,      // avoid black-hole if proxy dies
-                        endpoint_independent_nat = true
+                        strict_route = true
                     }
                 },
 
                 outbounds = new object[]
                 {
-                    // PRIMARY outbound = VLESS proxy
-                    new
-                    {
+                    new { type = "direct", tag = "direct" },
+                    new { type = "block",  tag = "block"  },
+                    new {
                         type = "vless",
                         tag  = "proxy",
-                        server = ob.Server,
-                        server_port = ob.Port,
-                        uuid = ob.Uuid,
-                        flow = string.IsNullOrWhiteSpace(ob.Flow) ? null : ob.Flow,
+                        server = host,
+                        server_port = port,
+                        uuid = uuid,
+                        flow = string.IsNullOrWhiteSpace(flow) ? null : flow,
+                        transport = new { type = "tcp" },
                         tls = new
                         {
                             enabled = true,
-                            server_name = ob.Sni ?? ob.Server,
-                            utls = new { enabled = true, fingerprint = ob.Fp ?? "chrome" },
-                            reality = new { enabled = true, public_key = ob.Pbk ?? "", short_id = ob.Sid ?? "" }
-                        },
-                        transport = new { type = ob.Transport ?? "tcp" },
-                        packet_encoding = "xudp"
-                    },
-
-                    new { type = "direct", tag = "direct" },
-                    new { type = "block",  tag = "block" }
+                            server_name = string.IsNullOrWhiteSpace(sni) ? host : sni,
+                            insecure = false,
+                            utls = new { enabled = true, fingerprint = string.IsNullOrWhiteSpace(fp) ? "chrome" : fp },
+                            reality = new { enabled = true, public_key = pbk, short_id = sid ?? "" }
+                        }
+                    }
                 },
 
                 route = new
                 {
-                    auto_detect_interface = true,
-                    final = "proxy",                 // send everything through proxy
                     rules = new object[]
                     {
-                        new { protocol = "dns", outbound = "proxy" }   // DNS goes through tunnel
+                        // send all traffic from TUN to proxy
+                        new { inbound = new [] { "tun-in" }, outbound = "proxy" },
+
+                        // DNS must go out direct during bootstrap
+                        new { protocol = new[]{ "dns" }, outbound = "direct" },
+
+                        // safety
+                        new { geoip = new[]{ "private" }, outbound = "direct" }
                     }
                 }
             };
@@ -168,41 +141,26 @@ namespace SimpleVPN.Desktop
             return JsonSerializer.Serialize(cfg, new JsonSerializerOptions { WriteIndented = true });
         }
 
-        // Minimal VLESS Reality parser (no external deps)
-        private static (string Server, int Port, string Uuid, string? Sni, string? Pbk, string? Sid, string? Flow, string? Fp, string? Transport) ParseVless(string uriStr)
+        static (string host, int port, string uuid, string sni, string pbk, string sid, string flow, string fp) ParseVless(string vless)
         {
-            var uri = new Uri(uriStr);
-            var server = uri.Host;
-            var port = uri.Port;
-            var uuid = uri.UserInfo; // vless://<uuid>@host:port
+            // expected like:
+            // vless://<uuid>@host:443?encryption=none&security=reality&type=tcp&flow=xtls-rprx-vision&fp=chrome&pbk=...&sid=...&sni=www.microsoft.com#name
+            var u = new Uri(vless);
+            var host = u.Host;
+            var port = u.IsDefaultPort ? 443 : u.Port;
+            var uuid = u.UserInfo;
 
-            var q = ParseQuery(uri.Query);
-            q.TryGetValue("sni", out var sni);
-            q.TryGetValue("pbk", out var pbk);
-            q.TryGetValue("sid", out var sid);
-            q.TryGetValue("flow", out var flow);
-            q.TryGetValue("fp", out var fp);
-            q.TryGetValue("type", out var transport);
-
-            return (server, port, uuid, sni, pbk, sid, flow, fp, transport);
-        }
-
-        private static Dictionary<string, string> ParseQuery(string query)
-        {
-            var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            if (string.IsNullOrEmpty(query)) return dict;
-            var span = query.AsSpan();
-            if (span[0] == '?') span = span[1..];
-
-            foreach (var part in span.ToString().Split('&', StringSplitOptions.RemoveEmptyEntries))
-            {
-                var idx = part.IndexOf('=');
-                string k, v;
-                if (idx < 0) { k = part; v = ""; }
-                else { k = part[..idx]; v = part[(idx + 1)..]; }
-                dict[Uri.UnescapeDataString(k)] = Uri.UnescapeDataString(v);
-            }
-            return dict;
+            var q = System.Web.HttpUtility.ParseQueryString(u.Query);
+            return (
+                host,
+                port,
+                uuid,
+                q["sni"] ?? host,
+                q["pbk"] ?? "",
+                q["sid"] ?? "",
+                q["flow"] ?? "",
+                q["fp"] ?? "chrome"
+            );
         }
     }
 }

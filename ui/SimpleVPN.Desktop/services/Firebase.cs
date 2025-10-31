@@ -1,3 +1,4 @@
+﻿// File: services/FirebaseClient.cs
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -9,18 +10,19 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 
-namespace SimpleVPN.Desktop
+namespace SimpleVPN.Desktop.Services
 {
-    public sealed class FirebaseClient
+    // NOTE: class name = Firebase (matches what your code is using)
+    public sealed class Firebase
     {
-        readonly string _projectId;
-        readonly string _apiKey;
-        string? _idToken;
-        string? _uid;
+        private readonly string _projectId;
+        private readonly string _apiKey;
+        private string? _idToken;
+        private string? _uid;
 
-        static readonly HttpClient Http = new HttpClient();
+        private static readonly HttpClient Http = new HttpClient();
 
-        public FirebaseClient(string projectId, string apiKey)
+        public Firebase(string projectId, string apiKey)
         {
             _projectId = projectId;
             _apiKey = apiKey;
@@ -60,31 +62,43 @@ namespace SimpleVPN.Desktop
             rsp.EnsureSuccessStatusCode();
         }
 
-        public async Task SetDocAsync(string path, object payload, CancellationToken ct = default)
+        public async Task<JsonElement> RunQueryAsync(string collectionPath, string field, string value, CancellationToken ct = default)
         {
-            var req = new HttpRequestMessage(HttpMethod.Patch, $"{FsBase}/{path}");
+            var url = $"{FsBase}/{collectionPath}:runQuery";
+            var body = new
+            {
+                structuredQuery = new
+                {
+                    from = new[] { new { collectionId = collectionPath.Split('/').Last() } },
+                    where = new
+                    {
+                        fieldFilter = new
+                        {
+                            field = new { fieldPath = field },
+                            op = "EQUAL",
+                            value = new { stringValue = value }
+                        }
+                    },
+                    limit = 1
+                }
+            };
+            var req = new HttpRequestMessage(HttpMethod.Post, url);
             AttachAuth(req);
-            req.Content = new StringContent(ToFsDoc(payload), Encoding.UTF8, "application/json");
+            req.Content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
             var rsp = await Http.SendAsync(req, ct);
             rsp.EnsureSuccessStatusCode();
+            using var doc = JsonDocument.Parse(await rsp.Content.ReadAsStringAsync(ct));
+            return doc.RootElement.Clone();
         }
 
-        void AttachAuth(HttpRequestMessage req)
+        private void AttachAuth(HttpRequestMessage req)
         {
             if (!string.IsNullOrEmpty(_idToken))
                 req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _idToken);
         }
 
-        static async Task<JsonElement> PostJsonAsync(string url, object body, CancellationToken ct)
-        {
-            var rsp = await Http.PostAsync(url, new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json"), ct);
-            var txt = await rsp.Content.ReadAsStringAsync(ct);
-            rsp.EnsureSuccessStatusCode();
-            using var doc = JsonDocument.Parse(txt);
-            return doc.RootElement.Clone();
-        }
-
-        static string ToFsDoc(object o)
+        // -------- Firestore JSON helpers --------
+        private static string ToFsDoc(object o)
         {
             return JsonSerializer.Serialize(new { fields = ToFields(o) });
 
@@ -93,15 +107,18 @@ namespace SimpleVPN.Desktop
                 var dict = new Dictionary<string, object>();
                 foreach (var p in obj.GetType().GetProperties())
                 {
-                    dict[p.Name] = ToFsValue(p.GetValue(obj));
+                    var name = p.Name;
+                    var value = p.GetValue(obj);
+                    dict[name] = ToFsValue(value);
                 }
                 return dict;
             }
 
-            static object ToFsValue(object? v) =>
-                v switch
+            static object ToFsValue(object? v)
+            {
+                if (v == null) return new { nullValue = (string?)null };
+                return v switch
                 {
-                    null => new { nullValue = (string?)null },
                     string s => new { stringValue = s },
                     bool b => new { booleanValue = b },
                     int i => new { integerValue = i.ToString() },
@@ -111,23 +128,32 @@ namespace SimpleVPN.Desktop
                     IDictionary<string, object> map => new { mapValue = new { fields = map.ToDictionary(kv => kv.Key, kv => ToFsValue(kv.Value)) } },
                     _ => new { stringValue = v.ToString() }
                 };
-
+            }
         }
 
-        public static string? GetString(JsonElement doc, string field)
+        // -------- Field readers --------
+        public static string? GetString(JsonElement document, string fieldPath)
         {
-            if (!doc.TryGetProperty("fields", out var fields)) return null;
-            if (!fields.TryGetProperty(field, out var f)) return null;
+            if (!document.TryGetProperty("fields", out var fields)) return null;
+            if (!fields.TryGetProperty(fieldPath, out var f)) return null;
             return f.TryGetProperty("stringValue", out var s) ? s.GetString() : null;
         }
 
-        public static bool? GetBool(JsonElement doc, string field)
+        public static bool? GetBool(JsonElement document, string fieldPath)
         {
-            if (!doc.TryGetProperty("fields", out var fields)) return null;
-            if (!fields.TryGetProperty(field, out var f)) return null;
+            if (!document.TryGetProperty("fields", out var fields)) return null;
+            if (!fields.TryGetProperty(fieldPath, out var f)) return null;
             return f.TryGetProperty("booleanValue", out var b) ? b.GetBoolean() : (bool?)null;
         }
 
+        public static JsonElement? GetMap(JsonElement document, string fieldPath)
+        {
+            if (!document.TryGetProperty("fields", out var fields)) return null;
+            if (!fields.TryGetProperty(fieldPath, out var f)) return null;
+            return f.TryGetProperty("mapValue", out var m) ? m.GetProperty("fields") : (JsonElement?)null;
+        }
+
+        // Stable device id
         public static string DeviceId()
         {
             string mg = Microsoft.Win32.Registry.GetValue(@"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Cryptography", "MachineGuid", "")?.ToString() ?? "";
@@ -135,6 +161,15 @@ namespace SimpleVPN.Desktop
             using var sha = SHA256.Create();
             var hash = sha.ComputeHash(Encoding.UTF8.GetBytes(mg + "|" + sid));
             return Convert.ToHexString(hash).ToLowerInvariant();
+        }
+
+        private static async Task<JsonElement> PostJsonAsync(string url, object body, CancellationToken ct)
+        {
+            var rsp = await Http.PostAsync(url, new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json"), ct);
+            var txt = await rsp.Content.ReadAsStringAsync(ct);
+            rsp.EnsureSuccessStatusCode();
+            using var doc = JsonDocument.Parse(txt);
+            return doc.RootElement.Clone();
         }
     }
 }

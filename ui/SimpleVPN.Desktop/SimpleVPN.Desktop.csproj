@@ -1,4 +1,5 @@
 <Project Sdk="Microsoft.NET.Sdk.WindowsDesktop">
+
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0-windows</TargetFramework>
@@ -6,12 +7,28 @@
     <UseWindowsForms>true</UseWindowsForms>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+
+    <!-- App entry + icon -->
     <ApplicationIcon>Assets\logo.ico</ApplicationIcon>
     <StartupObject>SimpleVPN.Desktop.App</StartupObject>
+
+    <!-- publish config -->
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <DebugType>None</DebugType>
+    <DebugSymbols>false</DebugSymbols>
   </PropertyGroup>
 
+  <!-- Copy app icon -->
   <ItemGroup>
-    <None Include="assets\logo.ico" CopyToOutputDirectory="Always" />
-    <None Include="sing-box\**\*" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\assets\logo.ico" Link="Assets\logo.ico" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
+
+  <!-- Copy sing-box binaries into publish/bin/sing-box -->
+  <ItemGroup>
+    <None Include="..\..\bin\sing-box\**\*" 
+          Link="bin\sing-box\%(RecursiveDir)%(Filename)%(Extension)" 
+          CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>
