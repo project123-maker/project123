@@ -1,93 +1,103 @@
-using System;
 using System.Diagnostics;
-using System.IO;
-using System.Security.Principal;
-using System.Threading;
-using System.Threading.Tasks;
+using System.Text.Json;
 
-namespace SimpleVPN.Desktop
+namespace SimpleVPN.Desktop;
+
+public static class SingBox
 {
-    public sealed class SingBox
+    public static string Root => Path.Combine(AppContext.BaseDirectory);
+    public static string BinDir => Path.Combine(Root, "bin", "sing-box");
+    public static string Exe => Path.Combine(BinDir, "sing-box.exe");
+    public static string ConfigPath => Path.Combine(BinDir, "config.json");
+
+    private static Process? _p;
+
+    public static void WriteConfigFromVless(string vless)
     {
-        Process _p;
-        public event Action<string> OutputReceived;
+        // Parse a few bits
+        var uri = new Uri(vless);
+        var uuid = uri.UserInfo;
+        var host = uri.Host;
+        var port = uri.Port;
+        var q = System.Web.HttpUtility.ParseQueryString(uri.Query);
+        var sni = q.Get("sni");
+        var pbk = q.Get("pbk");
+        var sid = q.Get("sid");
+        var fp = q.Get("fp");
+        var flow = q.Get("flow");
 
-        public async Task<bool> StartAsync(CancellationToken ct)
+        var cfg = new
         {
-            try
+            log = new { level = "info", timestamp = true },
+            dns = new
             {
-                var root = Path.Combine(AppContext.BaseDirectory, "sing-box");
-                var exe  = Path.Combine(root, "sing-box.exe");
-                var cfg  = Path.Combine(root, "config.json");
-                if (!File.Exists(exe) || !File.Exists(cfg)) { Output("sing-box assets missing"); return false; }
-
-                if (!IsElevated()) { Output("Admin required to create Wintun adapter."); return false; }
-
-                Stop(); // clean start
-
-                var psi = new ProcessStartInfo(exe, "run -c config.json")
-                {
-                    WorkingDirectory = root,
-                    UseShellExecute = false,
-                    RedirectStandardError = true,
-                    RedirectStandardOutput = true,
-                    CreateNoWindow = true
-                };
-                psi.Environment["ENABLE_DEPRECATED_SPECIAL_OUTBOUNDS"] = "true";
-
-                _p = new Process { StartInfo = psi, EnableRaisingEvents = true };
-                _p.OutputDataReceived += (_, e) => { if (e.Data != null) Output(e.Data); };
-                _p.ErrorDataReceived  += (_, e) => { if (e.Data != null) Output("[err] " + e.Data); };
-                _p.Exited += (_, __) => Output("sing-box exited.");
-
-                if (!_p.Start()) { Output("failed to start process"); return false; }
-                _p.BeginOutputReadLine();
-                _p.BeginErrorReadLine();
-
-                // Wait a bit; if it dies, fail.
-                var ok = await WaitHealthy(4000, ct);
-                if (!ok) { Stop(); return false; }
-                Output("sing-box running.");
-                return true;
-            }
-            catch (Exception ex)
+                servers = new object[] {
+                    new { tag="cf", address="https://1.1.1.1/dns-query", strategy="ipv4_only", detour="proxy" },
+                    new { tag="gg", address="https://dns.google/dns-query", strategy="ipv4_only", detour="proxy" }
+                },
+                strategy = "ipv4_only",
+                disable_cache = true,
+                rules = new object[] { new { outbound = "any", server = "cf" } }
+            },
+            inbounds = new object[] {
+                new {
+                    type="tun", tag="tun-in", interface_name="SimpleVPN",
+                    address = new [] { "172.19.0.1/30" },
+                    mtu=1400, stack="gvisor", auto_route=true, strict_route=true, sniff=true
+                }
+            },
+            outbounds = new object[] {
+                new {
+                    type="vless", tag="proxy", server=host, server_port=port, uuid=uuid, flow=flow,
+                    tls = new {
+                        enabled = true, server_name = sni,
+                        reality = new { enabled = true, public_key = pbk, short_id = sid },
+                        utls = fp is null ? null : new { enabled = true, fingerprint = fp }
+                    }
+                },
+                new { type="dns", tag="dns-out" },
+                new { type="direct", tag="direct" },
+                new { type="block", tag="block" }
+            },
+            route = new
             {
-                Output("start exception: " + ex.Message);
-                Stop();
-                return false;
+                auto_detect_interface = true,
+                default_domain_resolver = "cf",
+                final = "proxy",
+                rules = new object[] {
+                    new { protocol = new [] { "dns" }, outbound = "dns-out" },
+                    new { ip_is_private = true, outbound = "direct" }
+                }
             }
-        }
+        };
 
-        public void Stop()
+        Directory.CreateDirectory(BinDir);
+        File.WriteAllText(ConfigPath, JsonSerializer.Serialize(cfg, new JsonSerializerOptions { WriteIndented = true }));
+    }
+
+    public static void Start()
+    {
+        Stop();
+        _p = new Process
         {
-            try
+            StartInfo = new ProcessStartInfo
             {
-                if (_p == null) return;
-                if (!_p.HasExited) { _p.Kill(true); _p.WaitForExit(1000); }
+                FileName = Exe,
+                Arguments = $"run -c \"{ConfigPath}\"",
+                UseShellExecute = false,
+                CreateNoWindow = true
             }
-            catch { }
-            finally { _p = null; }
-        }
+        };
+        _p.Start();
+    }
 
-        static bool IsElevated()
+    public static void Stop()
+    {
+        try
         {
-            using var id = WindowsIdentity.GetCurrent();
-            var p = new WindowsPrincipal(id);
-            return p.IsInRole(WindowsBuiltInRole.Administrator);
+            if (_p != null && !_p.HasExited) _p.Kill(true);
         }
-
-        async Task<bool> WaitHealthy(int ms, CancellationToken ct)
-        {
-            var sw = Stopwatch.StartNew();
-            while (sw.ElapsedMilliseconds < ms)
-            {
-                if (_p == null || _p.HasExited) return false;
-                await Task.Delay(150, ct);
-            }
-            return true;
-        }
-
-        void Output(string s) => OutputReceived?.Invoke(s);
+        catch { /* ignore */ }
+        _p = null;
     }
 }
-
