@@ -31,3 +31,5 @@ service-account.json
 **/service-account.json
 firebaseConfig.json
 config.json
+
+secret/
