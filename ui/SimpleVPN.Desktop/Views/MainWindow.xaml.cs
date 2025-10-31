@@ -1,8 +1,10 @@
 ﻿using System;
 using System.ComponentModel;
+using System.IO;
 using System.Threading.Tasks;
 using System.Windows;
-using WF = System.Windows.Forms; // WinForms alias
+using System.Windows.Controls;
+using WF = System.Windows.Forms; // WinForms alias ONLY for tray
 
 namespace SimpleVPN.Desktop.Views
 {
@@ -14,16 +16,15 @@ namespace SimpleVPN.Desktop.Views
         {
             InitializeComponent();
 
-            // Create tray icon
+            // Build NotifyIcon (tray)
             _tray = new WF.NotifyIcon
             {
-                Icon = new System.Drawing.Icon("assets/logo.ico"),
+                Icon = LoadTrayIcon(),
                 Text = "SimpleVPN",
                 Visible = false,
                 ContextMenuStrip = new WF.ContextMenuStrip()
             };
 
-            // Tray menu items
             _tray.ContextMenuStrip.Items.Add("Show", null, (_, __) =>
             {
                 Show();
@@ -31,10 +32,9 @@ namespace SimpleVPN.Desktop.Views
                 _tray.Visible = false;
             });
 
-            _tray.ContextMenuStrip.Items.Add("Disconnect", null, (_, __) =>
+            _tray.ContextMenuStrip.Items.Add("Disconnect", null, async (_, __) =>
             {
-                // just call async method fire-and-forget
-                _ = DisconnectAsync();
+                await DisconnectAsync();
             });
 
             _tray.ContextMenuStrip.Items.Add("Exit (keeps VPN)", null, (_, __) =>
@@ -43,43 +43,71 @@ namespace SimpleVPN.Desktop.Views
                 System.Windows.Application.Current.Shutdown();
             });
 
+            // keep VPN running if window is closed
             Closing += MainWindow_Closing;
+        }
+
+        private static System.Drawing.Icon LoadTrayIcon()
+        {
+            try
+            {
+                var baseDir = AppContext.BaseDirectory;
+                var icoPath = Path.Combine(baseDir, "assets", "logo.ico");
+                if (File.Exists(icoPath))
+                    return new System.Drawing.Icon(icoPath);
+            }
+            catch { /* ignore */ }
+
+            // fallback: generic system icon
+            return System.Drawing.SystemIcons.Application;
         }
 
         private void MainWindow_Closing(object? sender, CancelEventArgs e)
         {
+            // Keep VPN running. Just hide window when connected.
             try
             {
-                if (SingBoxHelper.IsRunning())
+                if (SingBox.IsRunning)
                 {
                     e.Cancel = true;
                     Hide();
                     _tray.Visible = true;
                 }
             }
-            catch { /* ignore */ }
+            catch
+            {
+                // if anything goes wrong, allow normal close
+            }
         }
 
-        private async void ConnectBtn_Click(object? sender, RoutedEventArgs? e)
+        // ===== UI handlers =====
+
+        private async void ConnectBtn_Click(object sender, RoutedEventArgs e)
         {
             StatusText.Text = "Status: Connecting…";
             try
             {
-                await Task.Delay(500); // placeholder
+                // TODO: call your actual redeem + fetch VLESS flow here
+                // await LicensingServiceFlow.ConnectAsync(...);
+
+                await Task.Delay(300); // placeholder
                 StatusText.Text = "Status: Connected";
             }
             catch (Exception ex)
             {
                 Logger.Log("Connect failed: " + ex);
                 StatusText.Text = "Status: Connect failed";
-                System.Windows.MessageBox.Show("Connect failed. See log:\n" + Logger.LogPath,
-                    "SimpleVPN", MessageBoxButton.OK, MessageBoxImage.Error);
+                System.Windows.MessageBox.Show(
+                    "Connect failed. See log:\n" + Logger.LogPath,
+                    "SimpleVPN",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
             }
         }
 
-        private async void DisconnectBtn_Click(object? sender, RoutedEventArgs? e)
+        private async void DisconnectBtn_Click(object sender, RoutedEventArgs e)
         {
-            await DisconnectAsync();
+            _ = DisconnectAsync(); // fire & forget to keep WPF handler void
         }
 
         private async Task DisconnectAsync()
@@ -87,7 +115,8 @@ namespace SimpleVPN.Desktop.Views
             StatusText.Text = "Status: Disconnecting…";
             try
             {
-                await Task.Delay(300); // placeholder
+                // TODO: stop sing-box + release lock
+                await Task.Delay(200); // placeholder
                 StatusText.Text = "Status: Disconnected";
             }
             catch (Exception ex)
@@ -95,15 +124,6 @@ namespace SimpleVPN.Desktop.Views
                 Logger.Log("Disconnect failed: " + ex);
                 StatusText.Text = "Status: Disconnect failed";
             }
-        }
-    }
-
-    internal static class SingBoxHelper
-    {
-        public static bool IsRunning()
-        {
-            try { return System.Diagnostics.Process.GetProcessesByName("sing-box").Length > 0; }
-            catch { return false; }
         }
     }
 }
