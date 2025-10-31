@@ -14,3 +14,20 @@ publish/
 .env
 config.json
 firebaseConfig.json
+# IDE
+.vs/
+*.suo
+*.user
+*.vsidx
+*.v2
+
+# Binaries & archives
+*.dll
+*.pdb
+*.zip
+
+# Secrets
+service-account.json
+**/service-account.json
+firebaseConfig.json
+config.json
